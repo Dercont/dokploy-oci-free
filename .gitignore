@@ -10,3 +10,8 @@
 .ssh
 **/node_modules/
 .terraform.lock.hcl
+
+# Terraform variable files (they hold your IP and keys) and saved plans
+*.tfvars
+*.tfvars.json
+plan.out

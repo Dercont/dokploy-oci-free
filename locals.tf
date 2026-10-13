@@ -1,3 +1,17 @@
+# Oracle Always Free limits for the Arm A1 shape and for volumes (docs.oracle.com, Always Free Resources).
+# They are totals for the whole tenancy, so the main node and every worker share them.
+# These numbers are repeated by hand in variables.tf (validations), in the error messages of
+# main.tf and in the README, because a variable validation cannot read a local in Terraform 1.5:
+# change all of them together if Oracle changes the limits.
+locals {
+  always_free = {
+    max_ocpus          = 2
+    max_memory_gbs     = 12
+    max_boot_total_gbs = 200
+    min_boot_size_gbs  = 50 # Used when the disk size is left empty (the image default is 47 GB)
+  }
+}
+
 # Instance config
 locals {
   instance_config = {

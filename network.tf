@@ -38,32 +38,43 @@ resource "oci_core_default_route_table" "dokploy_default_route_table" {
   }
 }
 
+# Ports used between the Dokploy node and the workers (protocol 6 = TCP, 17 = UDP)
+locals {
+  node_to_node_ports = [
+    { protocol = "6", port = 22, description = "SSH from Dokploy to the workers (VCN only)" },
+    { protocol = "6", port = 2377, description = "Docker Swarm cluster management (VCN only)" },
+    { protocol = "6", port = 7946, description = "Docker Swarm node communication (VCN only)" },
+    { protocol = "17", port = 7946, description = "Docker Swarm node communication UDP (VCN only)" },
+    { protocol = "17", port = 4789, description = "Docker Swarm overlay network UDP (VCN only)" },
+  ]
+
+  # Administrator access: the Dokploy panel and SSH, only from admin_cidr
+  admin_ports = [
+    { port = 3000, description = "Dokploy panel (admin only)" },
+    { port = 22, description = "SSH (admin only)" },
+  ]
+}
+
 # Security List for Dokploy
 resource "oci_core_security_list" "dokploy_security_list" {
   compartment_id = var.compartment_id
   vcn_id         = oci_core_vcn.dokploy_vcn.id
   display_name   = "Dokploy Security List"
 
-  # Ingress Rules for Dokploy
-  ingress_security_rules {
-    protocol = "6" # TCP
-    source   = "0.0.0.0/0"
-    tcp_options {
-      min = 3000
-      max = 3000
-    }
-    description = "Allow HTTP traffic for Dokploy on port 3000"
-  }
+  # The panel (3000) and SSH (22) accept only admin_cidr. With close_admin_ports these two rules
+  # are removed: the OCI Bastion (enable_bastion, rules in bastion.tf) is then the only way in.
+  dynamic "ingress_security_rules" {
+    for_each = var.close_admin_ports ? [] : local.admin_ports
+    content {
+      protocol    = "6" # TCP
+      source      = var.admin_cidr
+      description = ingress_security_rules.value.description
 
-  # SSH
-  ingress_security_rules {
-    protocol = "6" # TCP
-    source   = "0.0.0.0/0"
-    tcp_options {
-      min = 22
-      max = 22
+      tcp_options {
+        min = ingress_security_rules.value.port
+        max = ingress_security_rules.value.port
+      }
     }
-    description = "Allow SSH traffic on port 22"
   }
 
   # HTTP & HTTPS traffic
@@ -112,76 +123,31 @@ resource "oci_core_security_list" "dokploy_security_list" {
     stateless   = "false"
   }
 
-  # Traefik Proxy
-  ingress_security_rules {
-    protocol = "6" # TCP
-    source   = "0.0.0.0/0"
-    tcp_options {
-      min = 81
-      max = 81
-    }
-    description = "Allow Traefik HTTP traffic on port 81"
-  }
+  # Traffic between nodes: SSH from Dokploy to the workers and Docker Swarm. These rules only
+  # exist when there are workers and only accept traffic from inside the VCN, never from the internet.
+  dynamic "ingress_security_rules" {
+    for_each = var.num_worker_instances > 0 ? local.node_to_node_ports : []
+    content {
+      protocol    = ingress_security_rules.value.protocol
+      source      = oci_core_vcn.dokploy_vcn.cidr_block
+      description = ingress_security_rules.value.description
 
-  ingress_security_rules {
-    protocol = "6" # TCP
-    source   = "0.0.0.0/0"
-    tcp_options {
-      min = 444
-      max = 444
-    }
-    description = "Allow Traefik HTTPS traffic on port 444"
-  }
+      dynamic "tcp_options" {
+        for_each = ingress_security_rules.value.protocol == "6" ? [ingress_security_rules.value.port] : []
+        content {
+          min = tcp_options.value
+          max = tcp_options.value
+        }
+      }
 
-  # Ingress rules for Docker Swarm
-  ingress_security_rules {
-    protocol = "6" # TCP
-    source   = "0.0.0.0/0"
-    tcp_options {
-      min = 2376
-      max = 2376
+      dynamic "udp_options" {
+        for_each = ingress_security_rules.value.protocol == "17" ? [ingress_security_rules.value.port] : []
+        content {
+          min = udp_options.value
+          max = udp_options.value
+        }
+      }
     }
-    description = "Allow Docker Swarm traffic on port 2376"
-  }
-
-  ingress_security_rules {
-    protocol = "6" # TCP
-    source   = "0.0.0.0/0"
-    tcp_options {
-      min = 2377
-      max = 2377
-    }
-    description = "Allow Docker Swarm traffic on port 2377"
-  }
-
-  ingress_security_rules {
-    protocol = "6" # TCP
-    source   = "0.0.0.0/0"
-    tcp_options {
-      min = 7946
-      max = 7946
-    }
-    description = "Allow Docker Swarm traffic on port 7946"
-  }
-
-  ingress_security_rules {
-    protocol = "17" # UDP
-    source   = "0.0.0.0/0"
-    udp_options {
-      min = 7946
-      max = 7946
-    }
-    description = "Allow Docker Swarm UDP traffic on port 7946"
-  }
-
-  ingress_security_rules {
-    protocol = "17" # UDP
-    source   = "0.0.0.0/0"
-    udp_options {
-      min = 4789
-      max = 4789
-    }
-    description = "Allow Docker Swarm UDP traffic on port 4789"
   }
 
   # Egress Rule (optional, if needed)
@@ -189,5 +155,14 @@ resource "oci_core_security_list" "dokploy_security_list" {
     protocol    = "all"
     destination = "0.0.0.0/0"
     description = "Allow all egress traffic"
+  }
+
+  lifecycle {
+    # Closing 22 and 3000 without a bastion would leave no way in. Terraform 1.5 cannot compare
+    # two variables in a variable validation, so it is checked here.
+    precondition {
+      condition     = !var.close_admin_ports || var.enable_bastion
+      error_message = "close_admin_ports = true needs enable_bastion = true: with ports 22 and 3000 closed and no bastion there would be no way in."
+    }
   }
 }

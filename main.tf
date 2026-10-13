@@ -9,7 +9,11 @@ resource "oci_core_instance" "dokploy_main" {
 
   metadata = {
     ssh_authorized_keys = local.instance_config.ssh_authorized_keys
-    user_data           = base64encode(file("./bin/dokploy-main.sh"))
+    user_data = base64encode(templatefile("./bin/dokploy-main.sh", {
+      dokploy_version = var.dokploy_version
+      admin_cidr      = var.admin_cidr
+      vcn_cidr        = oci_core_vcn.dokploy_vcn.cidr_block
+    }))
   }
 
   create_vnic_details {
@@ -18,6 +22,10 @@ resource "oci_core_instance" "dokploy_main" {
     assign_ipv6ip             = false
     assign_private_dns_record = true
     assign_public_ip          = !var.use_reserved_public_ip
+
+    # With enable_bastion, only the bastion's private endpoint can reach ports 22 and 3000 from
+    # inside the subnet (see bastion.tf).
+    nsg_ids = var.enable_bastion ? [oci_core_network_security_group.bastion[0].id] : []
   }
 
   availability_config {
@@ -71,7 +79,7 @@ resource "oci_core_instance" "dokploy_main" {
       name          = "Compute HPC RDMA Authentication"
     }
     plugins_config {
-      desired_state = "ENABLED"
+      desired_state = "DISABLED"
       name          = "Cloud Guard Workload Protection"
     }
     plugins_config {
@@ -81,6 +89,31 @@ resource "oci_core_instance" "dokploy_main" {
     plugins_config {
       desired_state = "DISABLED"
       name          = "Bastion"
+    }
+  }
+
+  # The cloud-init script only runs on the first boot, so editing it (or dokploy_version) must
+  # never replace a server that is already running.
+  lifecycle {
+    ignore_changes = [metadata["user_data"]]
+
+    # Always Free limits are totals for the main node plus all workers. Terraform 1.5 (the version
+    # Resource Manager runs) cannot compare two variables in a variable validation, so the totals
+    # are checked here, before anything is created. They only look at the final state, not at the
+    # order of the changes: see "Adding or removing a worker" in the README.
+    precondition {
+      condition     = (1 + var.num_worker_instances) * tonumber(var.ocpus) <= local.always_free.max_ocpus
+      error_message = "Over the Always Free Arm limit: (1 + num_worker_instances) x ocpus must be at most 2 OCPUs in total."
+    }
+
+    precondition {
+      condition     = (1 + var.num_worker_instances) * tonumber(var.memory_in_gbs) <= local.always_free.max_memory_gbs
+      error_message = "Over the Always Free Arm limit: (1 + num_worker_instances) x memory_in_gbs must be at most 12 GB in total."
+    }
+
+    precondition {
+      condition     = (1 + var.num_worker_instances) * coalesce(var.boot_volume_size_in_gbs, local.always_free.min_boot_size_gbs) <= local.always_free.max_boot_total_gbs
+      error_message = "Over the Always Free storage limit: (1 + num_worker_instances) x boot_volume_size_in_gbs must be at most 200 GB in total."
     }
   }
 }
@@ -98,7 +131,9 @@ resource "oci_core_instance" "dokploy_worker" {
 
   metadata = {
     ssh_authorized_keys = local.instance_config.ssh_authorized_keys
-    user_data           = base64encode(file("./bin/dokploy-worker.sh"))
+    user_data = base64encode(templatefile("./bin/dokploy-worker.sh", {
+      vcn_cidr = oci_core_vcn.dokploy_vcn.cidr_block
+    }))
   }
 
   create_vnic_details {
@@ -160,7 +195,7 @@ resource "oci_core_instance" "dokploy_worker" {
       name          = "Compute HPC RDMA Authentication"
     }
     plugins_config {
-      desired_state = "ENABLED"
+      desired_state = "DISABLED"
       name          = "Cloud Guard Workload Protection"
     }
     plugins_config {
@@ -171,5 +206,16 @@ resource "oci_core_instance" "dokploy_worker" {
       desired_state = "DISABLED"
       name          = "Bastion"
     }
+  }
+
+  # Create the worker only after the main node is up to date. When the main node is shrunk in the
+  # same apply that adds the worker (2 OCPUs and 12 GB down to 1 and 6), the two would otherwise
+  # run in parallel and, for a few minutes, the tenancy would hold more than the Always Free limit.
+  depends_on = [oci_core_instance.dokploy_main]
+
+  # The cloud-init script only runs on the first boot, so editing it must never replace a worker
+  # that is already running.
+  lifecycle {
+    ignore_changes = [metadata["user_data"]]
   }
 }
